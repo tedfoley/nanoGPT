@@ -16,4 +16,6 @@ gradient_accumulation_steps = 2
 
 # Dataset
 dataset = 'shakespeare_char'  # Use character-level Shakespeare dataset
-wandb_log = False            # Disable wandb logging for testing
+wandb_log = True             # Enable wandb logging
+wandb_project = 'nanogpt'    # Your project name
+wandb_run_name = 'compact-gpt2-test'  # Name for this particular run
