@@ -15,4 +15,5 @@ batch_size = 4
 gradient_accumulation_steps = 2
 
 # Dataset
-dataset = 'shakespeare'  # Use smaller Shakespeare dataset instead of OpenWebText
+dataset = 'shakespeare_char'  # Use character-level Shakespeare dataset
+wandb_log = False            # Disable wandb logging for testing
