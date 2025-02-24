@@ -44,6 +44,9 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
+
+compile_backend = 'inductor' # options: 'inductor', 'aot_eager', 'aot_nvfuser', etc.
+
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
@@ -202,10 +205,11 @@ if init_from == 'resume':
 checkpoint = None # free up memory
 
 # compile the model
+# compile the model
 if compile:
-    print("compiling the model... (takes a ~minute)")
+    print(f"compiling the model with {compile_backend} backend... (takes a ~minute)")
     unoptimized_model = model
-    model = torch.compile(model) # requires PyTorch 2.0
+    model = torch.compile(model, backend=compile_backend) # requires PyTorch 2.0
 
 # wrap model into DDP container
 if ddp:

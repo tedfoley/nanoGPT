@@ -12,7 +12,7 @@ n_layer = 8        # Down from 12
 n_head = 8         # Down from 12
 n_embd = 512       # Down from 768
 block_size = 512   # Reduced context length
-dropout = 0.2      # Increased from 0.0 for regularization
+dropout = 0.15  # Slightly lower than 0.2
 
 # Batch size configuration
 # Original: 12 * 1024 * 40 = 491,520
@@ -40,8 +40,8 @@ decay_lr = True
 lr_decay_type = 'cosine'
 
 # Evaluation settings
-eval_interval = 1000
-eval_iters = 200
+eval_interval = 200
+eval_iters = 100
 log_interval = 10
 
 # Regularization
