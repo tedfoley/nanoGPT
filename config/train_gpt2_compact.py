@@ -23,16 +23,21 @@ gradient_accumulation_steps = 8
 # Training schedule
 # Reduced from original 600k iterations due to smaller model
 max_iters = 400000
-warmup_iters = 1500
+warmup_iters = 2000
 lr_decay_iters = 400000
 
 # Learning rate configuration
 # Scaled based on model size: 6e-4 * sqrt(512/768)
-learning_rate = 5e-4
-min_lr = 5e-5  # 10% of base lr
+learning_rate = 6e-4
+min_lr = 6e-5    # 10% of base lr
 beta1 = 0.9
 beta2 = 0.95
 grad_clip = 1.0
+
+# Add cosine learning rate schedule
+lr_decay_iters = 400000
+decay_lr = True
+lr_decay_type = 'cosine'
 
 # Evaluation settings
 eval_interval = 1000
