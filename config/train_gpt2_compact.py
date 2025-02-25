@@ -27,9 +27,9 @@ batch_size = 64
 gradient_accumulation_steps = 8
 
 # Training schedule - reduced for faster results
-max_iters = 200000  # Halved from 400k if speed is priority
+max_iters = 50000  
 warmup_iters = 1000
-lr_decay_iters = 200000
+lr_decay_iters = 50000
 
 # Learning rate configuration
 # Scaled based on model size: 6e-4 * sqrt(512/768)
@@ -40,7 +40,7 @@ beta2 = 0.95
 grad_clip = 1.0
 
 # Learning rate schedule
-lr_decay_iters = 200000  # Reduced to match max_iters
+lr_decay_iters = 50000  # Reduced to match max_iters
 decay_lr = True
 lr_decay_type = 'cosine'  # Keep this parameter
 
