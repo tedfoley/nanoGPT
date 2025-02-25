@@ -4,7 +4,7 @@ from config.train_gpt2_compact import *  # Import base config
 # Override with specific configuration
 wandb_log = True
 wandb_project = 'nanoGPT-algo-test'
-wandb_run_name = 'no_features'
+wandb_run_name = 'rope'
 
 # Feature toggles
 use_layer_norm = False
