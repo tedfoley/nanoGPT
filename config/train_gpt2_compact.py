@@ -39,7 +39,7 @@ decay_lr = True
 lr_decay_type = 'cosine'  # Keep this parameter
 
 # Evaluation settings
-eval_interval = 500
+eval_interval = 200
 eval_iters = 100
 log_interval = 10
 
