@@ -26,6 +26,21 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+def _rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., :x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    # Reshape cos/sin for proper broadcasting
+    cos = cos.unsqueeze(0).unsqueeze(0)  # (1, 1, T, hs)
+    sin = sin.unsqueeze(0).unsqueeze(0)  # (1, 1, T, hs)
+    
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -49,29 +64,86 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
+        #added line to fix bug
+        self.use_sparse_attn = config.use_sparse_attn
+
+        # Add RoPE parameters if enabled
+        self.use_rope = config.use_rope
+        if self.use_rope:
+            self.head_dim = self.n_embd // self.n_head
+            inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
+            self.register_buffer("inv_freq", inv_freq)
+        
+        # Flash attention toggle
+        self.use_flash_attn = config.use_flash_attn and hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.use_flash_attn:
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                      .view(1, 1, config.block_size, config.block_size))
+    
+    def _get_rotary_embeddings(self, seq_len, device):
+        t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        return emb.cos(), emb.sin()
+        
+    # Modification to CausalSelfAttention.forward method
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        B, T, C = x.size()
+        
+        # calculate query, key, values for all heads in batch
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        
+        # Apply RoPE if enabled
+        if self.use_rope:
+            cos, sin = self._get_rotary_embeddings(T, x.device)
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        
+        # Attention mechanism selection
+        if self.use_flash_attn:
+            # Flash attention
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, 
+                                                            dropout_p=self.dropout if self.training else 0, 
+                                                            is_causal=True)
+        elif self.use_sparse_attn:
+            # Sparse attention implementation
+            # We'll implement a simple sparse pattern: each token attends to itself,
+            # the first token, and a window of nearby tokens
+            
+            # Create sparse mask
+            window_size = int(math.sqrt(T))  # Simple heuristic for window size
+            sparse_mask = torch.zeros(T, T, device=x.device)
+            
+            # Each token attends to itself and tokens within the window
+            for i in range(T):
+                # Causal: only attend to previous tokens
+                start_idx = max(0, i - window_size)
+                sparse_mask[i, start_idx:i+1] = 1
+                
+                # Always attend to the first token (global info)
+                sparse_mask[i, 0] = 1
+            
+            sparse_mask = sparse_mask.view(1, 1, T, T)
+            
+            # Compute attention with sparse mask
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill((1 - sparse_mask) > 0, float('-inf'))  # Apply sparse mask
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))  # Apply causal mask
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v
         else:
-            # manual implementation of attention
+            # Standard attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
+            y = att @ v
+            
+        # Rest of the forward pass
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -92,12 +164,17 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        if config.use_layer_norm:
+            self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+            self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        else:
+            # Identity function when layer norm is disabled
+            self.ln_1 = lambda x: x
+            self.ln_2 = lambda x: x
+            
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -108,12 +185,18 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    vocab_size: int = 50304  # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    
+    # Feature toggles
+    use_layer_norm: bool = True     # Toggle layer normalization
+    use_rope: bool = False          # Toggle rotary position embeddings
+    use_flash_attn: bool = True     # Toggle flash attention (if available)
+    use_sparse_attn: bool = False   # Toggle sparse attention
 
 class GPT(nn.Module):
 
@@ -171,14 +254,23 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        
+        # Get token embeddings
+        tok_emb = self.transformer.wte(idx)  # (b, t, n_embd)
+        
+        # Only add positional embeddings if not using RoPE
+        if not self.config.use_rope:
+            pos = torch.arange(0, t, dtype=torch.long, device=device)
+            pos_emb = self.transformer.wpe(pos)  # (t, n_embd)
+            x = self.transformer.drop(tok_emb + pos_emb)
+        else:
+            # With RoPE, position information is added in the attention layer
+            x = self.transformer.drop(tok_emb)
+        
+        # Rest of the forward pass
         for block in self.transformer.h:
             x = block(x)
+        
         x = self.transformer.ln_f(x)
 
         if targets is not None:

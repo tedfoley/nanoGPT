@@ -14,6 +14,12 @@ n_embd = 512
 block_size = 512
 dropout = 0.1  # Slightly reduced for faster training
 
+#Toggling algorithmic improvements:
+use_layer_norm = False
+use_rope = False
+use_flash_attn = False
+use_sparse_attn = False
+
 # Batch size configuration
 # Original: 12 * 1024 * 40 = 491,520
 # New: 64 * 512 * 8 = 262,144 (still substantial)
