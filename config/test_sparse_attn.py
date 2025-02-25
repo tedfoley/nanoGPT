@@ -11,9 +11,3 @@ use_layer_norm = False
 use_rope = False
 use_flash_attn = False
 use_sparse_attn = True
-
-# Use smaller model for quick testing
-n_layer = 4
-block_size = 256
-batch_size = 8
-max_iters = 100
