@@ -87,10 +87,11 @@ class CausalSelfAttention(nn.Module):
         return emb.cos(), emb.sin()
         
     # Modification to CausalSelfAttention.forward method
+
     def forward(self, x):
         B, T, C = x.size()
         
-        # calculate query, key, values for all heads in batch
+        # Calculate query, key, values for all heads in batch
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
@@ -108,29 +109,37 @@ class CausalSelfAttention(nn.Module):
                                                             dropout_p=self.dropout if self.training else 0, 
                                                             is_causal=True)
         elif self.use_sparse_attn:
-            # Sparse attention implementation
-            # We'll implement a simple sparse pattern: each token attends to itself,
-            # the first token, and a window of nearby tokens
-            
-            # Create sparse mask
-            window_size = int(math.sqrt(T))  # Simple heuristic for window size
-            sparse_mask = torch.zeros(T, T, device=x.device)
-            
-            # Each token attends to itself and tokens within the window
-            for i in range(T):
-                # Causal: only attend to previous tokens
-                start_idx = max(0, i - window_size)
-                sparse_mask[i, start_idx:i+1] = 1
+            # Create the sparse attention pattern if it doesn't exist yet
+            if not hasattr(self, 'sparse_mask') or self.sparse_mask.size(-1) < T:
+                # Define a more effective sparse pattern
+                window_size = int(math.sqrt(T))
+                sparse_mask = torch.zeros(T, T, device=x.device)
                 
-                # Always attend to the first token (global info)
-                sparse_mask[i, 0] = 1
+                # Implement a more efficient pattern:
+                # 1. Causal diagonal stripe pattern
+                for i in range(T):
+                    # Attend to blocks of tokens to capture local context
+                    start_idx = max(0, i - window_size)
+                    sparse_mask[i, start_idx:i+1] = 1
+                    
+                    # Add global tokens - first token and every window_size token
+                    sparse_mask[i, 0] = 1
+                    global_indices = torch.arange(0, i, window_size, device=x.device)
+                    if global_indices.numel() > 0:
+                        sparse_mask[i, global_indices] = 1
+                
+                self.sparse_mask = sparse_mask.view(1, 1, T, T)
             
-            sparse_mask = sparse_mask.view(1, 1, T, T)
-            
-            # Compute attention with sparse mask
+            # Compute attention scores
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill((1 - sparse_mask) > 0, float('-inf'))  # Apply sparse mask
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))  # Apply causal mask
+            
+            # First apply causal mask
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            
+            # Then apply sparse mask (only to valid causal positions)
+            valid_sparse_mask = self.sparse_mask[:,:,:T,:T] * self.bias[:,:,:T,:T]
+            att = att.masked_fill((valid_sparse_mask == 0), float('-inf'))
+            
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v
