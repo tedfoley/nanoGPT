@@ -19,6 +19,7 @@ use_layer_norm = False
 use_rope = False
 use_flash_attn = False
 use_sparse_attn = False
+use_mqa = False 
 
 # Batch size configuration
 # Original: 12 * 1024 * 40 = 491,520

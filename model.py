@@ -46,16 +46,31 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.head_dim = config.n_embd // config.n_head
+        self.dropout = config.dropout
+        
+        # Add MQA toggle
+        self.use_mqa = config.use_mqa if hasattr(config, 'use_mqa') else False
+        
+        if self.use_mqa:
+            # For MQA: Multiple query heads, single key/value head
+            # n_embd for queries (all heads) + head_dim for keys + head_dim for values
+            self.c_attn = nn.Linear(config.n_embd, 
+                                   config.n_embd +  # For all query heads
+                                   2 * self.head_dim,  # For single key and value head
+                                   bias=config.bias)
+        else:
+            # Standard attention: key, query, value projections for all heads
+            self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+            
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
+        
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -64,18 +79,19 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-        #added line to fix bug
-        self.use_sparse_attn = config.use_sparse_attn
+        # Added line to fix bug
+        self.use_sparse_attn = config.use_sparse_attn if hasattr(config, 'use_sparse_attn') else False
 
         # Add RoPE parameters if enabled
-        self.use_rope = config.use_rope
+        self.use_rope = config.use_rope if hasattr(config, 'use_rope') else False
         if self.use_rope:
             self.head_dim = self.n_embd // self.n_head
             inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
             self.register_buffer("inv_freq", inv_freq)
         
         # Flash attention toggle
-        self.use_flash_attn = config.use_flash_attn and hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.use_flash_attn = (hasattr(config, 'use_flash_attn') and config.use_flash_attn 
+                              and hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
         if not self.use_flash_attn:
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                       .view(1, 1, config.block_size, config.block_size))
@@ -85,17 +101,31 @@ class CausalSelfAttention(nn.Module):
         freqs = torch.einsum('i,j->ij', t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
-        
-    # Modification to CausalSelfAttention.forward method
 
     def forward(self, x):
         B, T, C = x.size()
         
-        # Calculate query, key, values for all heads in batch
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        if self.use_mqa:
+            # MQA implementation
+            qkv = self.c_attn(x)
+            
+            # Split into query (all heads), key (single head), value (single head)
+            q = qkv[:, :, :self.n_embd]  # B, T, n_embd
+            k = qkv[:, :, self.n_embd:self.n_embd + self.head_dim]  # B, T, head_dim
+            v = qkv[:, :, -self.head_dim:]  # B, T, head_dim
+            
+            # Reshape query to heads
+            q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
+            
+            # For key and value, expand single head to all heads
+            k = k.unsqueeze(1).expand(B, self.n_head, T, self.head_dim)  # (B, nh, T, hs)
+            v = v.unsqueeze(1).expand(B, self.n_head, T, self.head_dim)  # (B, nh, T, hs)
+        else:
+            # Standard attention implementation
+            q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+            k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+            q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+            v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
         
         # Apply RoPE if enabled
         if self.use_rope:
@@ -202,10 +232,12 @@ class GPTConfig:
     bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     
     # Feature toggles
-    use_layer_norm: bool = True     # Toggle layer normalization
+    use_layer_norm: bool = False     # Toggle layer normalization
     use_rope: bool = False          # Toggle rotary position embeddings
-    use_flash_attn: bool = True     # Toggle flash attention (if available)
+    use_flash_attn: bool = False     # Toggle flash attention (if available)
     use_sparse_attn: bool = False   # Toggle sparse attention
+    use_mqa: bool = False  # Add toggle for Multi-Query Attention
+
 
 class GPT(nn.Module):
 
