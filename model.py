@@ -15,6 +15,13 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+try:
+    import xformers.ops as xops
+    from xformers.sparse import SparseCS
+    XFORMERS_AVAILABLE = True
+except ImportError:
+    XFORMERS_AVAILABLE = False
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -42,7 +49,6 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 class CausalSelfAttention(nn.Module):
-
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -51,12 +57,17 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.n_embd // config.n_head
         self.dropout = config.dropout
         
+        # Check for xformers if sparse attention is requested
+        self.use_sparse_attn = config.use_sparse_attn if hasattr(config, 'use_sparse_attn') else False
+        if self.use_sparse_attn and not XFORMERS_AVAILABLE:
+            raise ImportError("xformers is required for efficient sparse attention. "
+                              "Install with: pip install xformers")
+        
         # Add MQA toggle
         self.use_mqa = config.use_mqa if hasattr(config, 'use_mqa') else False
         
         if self.use_mqa:
             # For MQA: Multiple query heads, single key/value head
-            # n_embd for queries (all heads) + head_dim for keys + head_dim for values
             self.c_attn = nn.Linear(config.n_embd, 
                                    config.n_embd +  # For all query heads
                                    2 * self.head_dim,  # For single key and value head
@@ -71,55 +82,72 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
-
-        # Added line to fix bug
-        self.use_sparse_attn = config.use_sparse_attn if hasattr(config, 'use_sparse_attn') else False
-
-        # Add RoPE parameters if enabled
+        # Feature toggles and settings
         self.use_rope = config.use_rope if hasattr(config, 'use_rope') else False
+        self.use_flash_attn = (hasattr(config, 'use_flash_attn') and config.use_flash_attn 
+                              and hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
+        
+        # RoPE settings
         if self.use_rope:
             self.head_dim = self.n_embd // self.n_head
             inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
             self.register_buffer("inv_freq", inv_freq)
         
-        # Flash attention toggle
-        self.use_flash_attn = (hasattr(config, 'use_flash_attn') and config.use_flash_attn 
-                              and hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
-        if not self.use_flash_attn:
+        # Register causal mask for standard attention
+        if not self.use_flash_attn and not self.use_sparse_attn:
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                      .view(1, 1, config.block_size, config.block_size))
-    
+                                     .view(1, 1, config.block_size, config.block_size))
+        
+        # Store block size for sparse pattern creation
+        self.block_size = config.block_size
+        
+        # Keep track of last sequence length to avoid recreating sparse attention mask
+        self.last_seq_len = -1
+        self.attn_bias = None
+        
     def _get_rotary_embeddings(self, seq_len, device):
         t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
         freqs = torch.einsum('i,j->ij', t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
 
-    def _create_sparse_indices(self, seq_len, device):
-        # Precompute which indices each position should attend to
-        indices = []
+    def _create_sparse_layout(self, seq_len, device):
+        """
+        Create a sparse attention pattern combining:
+        1. Causal mask (attend only to the past)
+        2. Local window attention
+        3. Global token attention
+        """
+        # Create base causal mask (lower triangular)
+        mask = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
+        
+        # Convert to sparse format
+        sparse_mask = SparseCS.from_dense(mask.float().unsqueeze(0).unsqueeze(0))
+        
+        # Apply additional sparsity pattern within the causal mask
         window_size = int(math.sqrt(seq_len))
         
+        # Create local window + global tokens pattern
+        additional_connections = torch.zeros(seq_len, seq_len, device=device, dtype=torch.bool)
+        
         for i in range(seq_len):
-            # Local window + first token + global tokens
-            local_indices = torch.arange(max(0, i-window_size), i+1, device=device)
+            # Local window around position i
+            local_start = max(0, i - window_size)
+            additional_connections[i, local_start:i+1] = True
+            
+            # Global tokens: first token and every window_size token
+            additional_connections[i, 0] = True
             global_indices = torch.arange(0, min(i, seq_len), window_size, device=device)
-            
-            # Combine and deduplicate indices
-            position_indices = torch.cat([local_indices, global_indices])
-            position_indices = torch.unique(position_indices)
-            
-            indices.append(position_indices)
-            
-        return indices
-
+            if global_indices.numel() > 0:
+                additional_connections[i, global_indices] = True
+        
+        # Combine with causal mask (only allow connections already in the causal mask)
+        sparse_pattern = additional_connections & mask
+        
+        # Convert to attentional bias
+        attn_bias = SparseCS.from_dense(sparse_pattern.float().unsqueeze(0).unsqueeze(0))
+        
+        return attn_bias
 
     def forward(self, x):
         B, T, C = x.size()
@@ -158,32 +186,27 @@ class CausalSelfAttention(nn.Module):
                                                             dropout_p=self.dropout if self.training else 0, 
                                                             is_causal=True)
         elif self.use_sparse_attn:
-            # Define sparsity pattern (once per sequence length)
-            if not hasattr(self, 'sparse_indices') or len(self.sparse_indices) != T:
-                # Reset indices for new sequence length
-                self.sparse_indices = self._create_sparse_indices(T, device=x.device)
+            # Create/get sparse attention mask if sequence length changed
+            if self.last_seq_len != T:
+                self.attn_bias = self._create_sparse_layout(T, x.device)
+                self.last_seq_len = T
                 
-            # Initialize output
-            y = torch.zeros_like(q)
-            head_dim = C // self.n_head
+            # Use xformers for efficient sparse attention
+            # Reshape to match xformers expectations
+            q_reshaped = q.transpose(1, 2)  # [B, T, H, D]
+            k_reshaped = k.transpose(1, 2)  # [B, T, H, D]
+            v_reshaped = v.transpose(1, 2)  # [B, T, H, D]
             
-            # Process each position with its own sparse attention pattern
-            for i in range(T):
-                # Get the relevant keys/values for this position
-                indices = self.sparse_indices[i]  # Get precomputed indices
-                k_sparse = k[:, :, indices, :]    # Select only needed keys
-                v_sparse = v[:, :, indices, :]    # Select only needed values
-                
-                # Only compute attention for this position
-                q_pos = q[:, :, i:i+1, :]  # Just this query position
-                
-                # Compute attention scores only for the sparse pattern
-                attn_scores = (q_pos @ k_sparse.transpose(-2, -1)) / math.sqrt(head_dim)
-                attn_probs = F.softmax(attn_scores, dim=-1)
-                attn_probs = self.attn_dropout(attn_probs)
-                
-                # Get output for this position
-                y[:, :, i:i+1, :] = attn_probs @ v_sparse
+            # Call memory efficient attention with sparse pattern
+            y = xops.memory_efficient_attention(
+                q_reshaped, k_reshaped, v_reshaped,
+                attn_bias=self.attn_bias,
+                p=self.dropout if self.training else 0.0,
+                scale=1.0 / math.sqrt(self.head_dim)
+            )
+            
+            # Reshape back to expected format
+            y = y.reshape(B, T, self.n_head, self.head_dim).transpose(1, 2)  # [B, H, T, D]
         else:
             # Standard attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
