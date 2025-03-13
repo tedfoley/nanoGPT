@@ -118,36 +118,39 @@ class CausalSelfAttention(nn.Module):
         2. Local window attention
         3. Global token attention
         """
-        # Create base causal mask (lower triangular)
-        mask = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
+        # Create a dense attention pattern (1.0 = attend, 0.0 = mask)
+        dense_mask = torch.zeros(seq_len, seq_len, device=device)
         
-        # Convert to sparse format
-        sparse_mask = SparseCS.from_dense(mask.float().unsqueeze(0).unsqueeze(0))
+        # Window size for local attention (square root of sequence length)
+        window_size = max(1, int(math.sqrt(seq_len)))
         
-        # Apply additional sparsity pattern within the causal mask
-        window_size = int(math.sqrt(seq_len))
-        
-        # Create local window + global tokens pattern
-        additional_connections = torch.zeros(seq_len, seq_len, device=device, dtype=torch.bool)
-        
+        # Fill in the sparse pattern
         for i in range(seq_len):
-            # Local window around position i
-            local_start = max(0, i - window_size)
-            additional_connections[i, local_start:i+1] = True
+            # Each token always attends to itself
+            dense_mask[i, i] = 1.0
             
-            # Global tokens: first token and every window_size token
-            additional_connections[i, 0] = True
-            global_indices = torch.arange(0, min(i, seq_len), window_size, device=device)
-            if global_indices.numel() > 0:
-                additional_connections[i, global_indices] = True
+            if i > 0:
+                # Local window attention: attend to previous window_size tokens
+                start_idx = max(0, i - window_size)
+                dense_mask[i, start_idx:i] = 1.0
+                
+                # Global token attention
+                dense_mask[i, 0] = 1.0  # Always attend to the first token
+                
+                # Attend to strided global tokens (every window_size tokens)
+                for j in range(window_size, i, window_size):
+                    dense_mask[i, j] = 1.0
         
-        # Combine with causal mask (only allow connections already in the causal mask)
-        sparse_pattern = additional_connections & mask
+        # Apply causal constraint (only attend to past tokens)
+        causal_mask = torch.tril(torch.ones_like(dense_mask))
+        dense_mask = dense_mask * causal_mask
         
-        # Convert to attentional bias
-        attn_bias = SparseCS.from_dense(sparse_pattern.float().unsqueeze(0).unsqueeze(0))
+        # Format for xformers: [1, 1, seq_len, seq_len]
+        # This allows for broadcasting across all batch items and attention heads
+        dense_mask = dense_mask.unsqueeze(0).unsqueeze(0)
         
-        return attn_bias
+        # Convert to sparse format expected by xformers
+        return SparseCS.from_dense(dense_mask)
 
     def forward(self, x):
         B, T, C = x.size()
@@ -186,27 +189,28 @@ class CausalSelfAttention(nn.Module):
                                                             dropout_p=self.dropout if self.training else 0, 
                                                             is_causal=True)
         elif self.use_sparse_attn:
-            # Create/get sparse attention mask if sequence length changed
+            # Create/update sparse attention mask if sequence length changed
             if self.last_seq_len != T:
                 self.attn_bias = self._create_sparse_layout(T, x.device)
                 self.last_seq_len = T
-                
-            # Use xformers for efficient sparse attention
-            # Reshape to match xformers expectations
-            q_reshaped = q.transpose(1, 2)  # [B, T, H, D]
-            k_reshaped = k.transpose(1, 2)  # [B, T, H, D]
-            v_reshaped = v.transpose(1, 2)  # [B, T, H, D]
             
-            # Call memory efficient attention with sparse pattern
+            # Reshape tensors for xformers
+            # From: [batch, heads, seq, head_dim] to [batch, seq, heads, head_dim]
+            q_xf = q.transpose(1, 2)  # [B, T, H, D]
+            k_xf = k.transpose(1, 2)  # [B, T, H, D]
+            v_xf = v.transpose(1, 2)  # [B, T, H, D]
+            
+            # Use xformers memory_efficient_attention with sparse pattern
             y = xops.memory_efficient_attention(
-                q_reshaped, k_reshaped, v_reshaped,
+                q_xf, k_xf, v_xf,
                 attn_bias=self.attn_bias,
                 p=self.dropout if self.training else 0.0,
                 scale=1.0 / math.sqrt(self.head_dim)
             )
             
-            # Reshape back to expected format
-            y = y.reshape(B, T, self.n_head, self.head_dim).transpose(1, 2)  # [B, H, T, D]
+            # Reshape result back to expected format
+            # From: [batch, seq, heads, head_dim] to [batch, heads, seq, head_dim]
+            y = y.transpose(1, 2)  # [B, H, T, D]
         else:
             # Standard attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
