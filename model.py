@@ -15,6 +15,14 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+try:
+    # Only import if available
+    import deepspeed
+    from deepspeed.ops.sparse_attention import SparseSelfAttention
+    HAS_DEEPSPEED = True
+except ImportError:
+    HAS_DEEPSPEED = False
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -56,7 +64,6 @@ class CausalSelfAttention(nn.Module):
         
         if self.use_mqa:
             # For MQA: Multiple query heads, single key/value head
-            # n_embd for queries (all heads) + head_dim for keys + head_dim for values
             self.c_attn = nn.Linear(config.n_embd, 
                                    config.n_embd +  # For all query heads
                                    2 * self.head_dim,  # For single key and value head
@@ -79,22 +86,58 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-        # Added line to fix bug
+        # Feature toggles
         self.use_sparse_attn = config.use_sparse_attn if hasattr(config, 'use_sparse_attn') else False
-
-        # Add RoPE parameters if enabled
         self.use_rope = config.use_rope if hasattr(config, 'use_rope') else False
+        self.use_flash_attn = (hasattr(config, 'use_flash_attn') and config.use_flash_attn 
+                              and hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
+        
+        # Initialize RoPE parameters if enabled
         if self.use_rope:
             self.head_dim = self.n_embd // self.n_head
             inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
             self.register_buffer("inv_freq", inv_freq)
         
-        # Flash attention toggle
-        self.use_flash_attn = (hasattr(config, 'use_flash_attn') and config.use_flash_attn 
-                              and hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
+        # Initialize causal mask for non-flash attention
         if not self.use_flash_attn:
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                       .view(1, 1, config.block_size, config.block_size))
+        
+        # Initialize DeepSpeed sparse attention if available and enabled
+        self.ds_sparse_attn = None
+        if self.use_sparse_attn and HAS_DEEPSPEED:
+            print("Using DeepSpeed Sparse Attention!")
+            # Define sparse attention configuration
+            # Using block sparse attention pattern
+            sparse_attn_config = {
+                # Choose one of several predefined sparsity patterns
+                "mode": "fixed",  # Options: fixed, variable, bigbird, bslongformer
+                "block": 16,      # Block size (16 is efficient for GPU operations)
+                "different_layout_per_head": True,
+                "num_local_blocks": 4,  # Number of local blocks to attend to
+                "num_global_blocks": 1,  # Number of global blocks to attend to
+                "attention_dropout": config.dropout,
+                "horizontal_global_attention": False,
+                "num_different_global_patterns": 4,
+            }
+            
+            # Initialize sparse attention module
+            try:
+                self.ds_sparse_attn = SparseSelfAttention(
+                    sparsity_config=sparse_attn_config,
+                    max_seq_length=config.block_size,
+                    attn_mask_mode='add',  # 'add' for additive mask, 'mul' for multiplicative
+                    attention_dropout=config.dropout
+                )
+                print("DeepSpeed SparseSelfAttention initialized successfully")
+            except Exception as e:
+                print(f"Failed to initialize DeepSpeed SparseSelfAttention: {e}")
+                print("Falling back to standard attention")
+                self.ds_sparse_attn = None
+                self.use_sparse_attn = False
+        elif self.use_sparse_attn and not HAS_DEEPSPEED:
+            print("DeepSpeed is not available. Sparse attention will use standard attention instead.")
+            self.use_sparse_attn = False
     
     def _get_rotary_embeddings(self, seq_len, device):
         t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
@@ -132,47 +175,33 @@ class CausalSelfAttention(nn.Module):
             cos, sin = self._get_rotary_embeddings(T, x.device)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
         
-        # Attention mechanism selection
+        # Determine attention mechanism
         if self.use_flash_attn:
             # Flash attention
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, 
                                                             dropout_p=self.dropout if self.training else 0, 
                                                             is_causal=True)
-        elif self.use_sparse_attn:
-            # Create the sparse attention pattern if it doesn't exist yet
-            if not hasattr(self, 'sparse_mask') or self.sparse_mask.size(-1) < T:
-                # Define a more effective sparse pattern
-                window_size = int(math.sqrt(T))
-                sparse_mask = torch.zeros(T, T, device=x.device)
-                
-                # Implement a more efficient pattern:
-                # 1. Causal diagonal stripe pattern
-                for i in range(T):
-                    # Attend to blocks of tokens to capture local context
-                    start_idx = max(0, i - window_size)
-                    sparse_mask[i, start_idx:i+1] = 1
-                    
-                    # Add global tokens - first token and every window_size token
-                    sparse_mask[i, 0] = 1
-                    global_indices = torch.arange(0, i, window_size, device=x.device)
-                    if global_indices.numel() > 0:
-                        sparse_mask[i, global_indices] = 1
-                
-                self.sparse_mask = sparse_mask.view(1, 1, T, T)
+        elif self.use_sparse_attn and self.ds_sparse_attn is not None:
+            # DeepSpeed sparse attention
+            # Reshape tensors to what DeepSpeed expects
+            # DeepSpeed expects shape [seq_len, batch_size, num_heads, head_size]
+            q = q.permute(2, 0, 1, 3)  # [T, B, nh, hs]
+            k = k.permute(2, 0, 1, 3)  # [T, B, nh, hs]
+            v = v.permute(2, 0, 1, 3)  # [T, B, nh, hs]
             
-            # Compute attention scores
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # Create attention mask
+            attention_mask = torch.tril(torch.ones(T, T, device=x.device))
+            attention_mask = attention_mask.view(1, 1, T, T)
             
-            # First apply causal mask
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # Call DeepSpeed sparse attention
+            attn_output = self.ds_sparse_attn(
+                q, k, v,
+                key_padding_mask=None,  # No padding in this case
+                attn_mask=attention_mask  # Causal mask
+            )
             
-            # Then apply sparse mask (only to valid causal positions)
-            valid_sparse_mask = self.sparse_mask[:,:,:T,:T] * self.bias[:,:,:T,:T]
-            att = att.masked_fill((valid_sparse_mask == 0), float('-inf'))
-            
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v
+            # Reshape back to expected output format [B, nh, T, hs]
+            y = attn_output.permute(1, 2, 0, 3)
         else:
             # Standard attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -180,7 +209,7 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v
-            
+        
         # Rest of the forward pass
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
