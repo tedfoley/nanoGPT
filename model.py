@@ -131,25 +131,26 @@ class CausalSelfAttention(nn.Module):
                 import deepspeed
                 from deepspeed.ops.sparse_attention import SparseSelfAttention
                 
-                # Define sparse attention configuration
+                # Define sparse attention configuration - fixed based on diagnostic results
                 sparse_attn_config = {
                     "mode": "fixed",
                     "block": 16,
                     "different_layout_per_head": True,
                     "num_local_blocks": 4,
                     "num_global_blocks": 1,
-                    "attention_dropout": config.dropout,
+                    # Removed attention_dropout parameter that caused the error
                     "horizontal_global_attention": False,
                     "num_different_global_patterns": 4,
                 }
                 
                 # Try to initialize DeepSpeed sparse attention
                 try:
+                    # Fixed initialization based on your DeepSpeed version's API
                     self.ds_sparse_attn = SparseSelfAttention(
                         sparsity_config=sparse_attn_config,
                         max_seq_length=config.block_size,
-                        attn_mask_mode='add',
-                        attention_dropout=config.dropout
+                        attn_mask_mode='add'
+                        # Removed attention_dropout parameter
                     )
                     self._active_attn_mechanism = "deepspeed_sparse"
                     print("ATTENTION MECHANISM: DeepSpeed Sparse Attention SUCCESSFULLY initialized")
@@ -169,6 +170,21 @@ class CausalSelfAttention(nn.Module):
                     self.ds_sparse_attn = None
                     self.use_sparse_attn = False
                     self._active_attn_mechanism = "standard_fallback"
+                    
+                    # Check if CUDA extensions are compatible
+                    try:
+                        import deepspeed.ops.op_builder as op_builder
+                        sparse_attn_builder = op_builder.SparseAttnBuilder()
+                        if not sparse_attn_builder.is_compatible():
+                            with open(self.error_log_file, "a") as f:
+                                f.write("\n\nCUDA extension compatibility check:\n")
+                                f.write("DeepSpeed SparseAttn CUDA extension is NOT compatible with this environment.\n")
+                                f.write("This is likely due to CUDA version mismatch or missing build tools.\n")
+                                
+                            print(f"ATTENTION MECHANISM: CUDA extensions not compatible - see log for details")
+                    except Exception as ce:
+                        with open(self.error_log_file, "a") as f:
+                            f.write(f"\n\nError checking CUDA compatibility: {str(ce)}\n")
             except ImportError as e:
                 # Log the error to a file
                 error_msg = f"DeepSpeed import error: {str(e)}\n"
