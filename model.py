@@ -47,6 +47,9 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
 
+# This is a partial code snippet focusing just on the CausalSelfAttention class 
+# that needs modification to work with DDP
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -100,9 +103,13 @@ class CausalSelfAttention(nn.Module):
         # Store block size for sparse pattern creation
         self.block_size = config.block_size
         
-        # Keep track of last sequence length to avoid recreating sparse attention mask
-        self.last_seq_len = -1
-        self.attn_bias = None
+        # For sparse attention - register empty buffer initially
+        # This fixes the DDP synchronization issue
+        if self.use_sparse_attn:
+            self.register_buffer("attn_bias", None, persistent=False)
+        
+        # Modified: use register_buffer for last_seq_len instead of instance variable
+        self.register_buffer("last_seq_len", torch.tensor(-1, dtype=torch.long), persistent=False)
         
     def _get_rotary_embeddings(self, seq_len, device):
         t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
@@ -110,7 +117,6 @@ class CausalSelfAttention(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
 
-    # Replace your _create_sparse_layout method with:
     def _create_sparse_layout(self, seq_len, device):
         """
         Create a sparse attention pattern combining:
@@ -191,9 +197,10 @@ class CausalSelfAttention(nn.Module):
         
         elif self.use_sparse_attn:
             # Create/update sparse attention mask if sequence length changed
-            if self.last_seq_len != T:
+            # Modified to use registered buffer instead of instance variable
+            if self.last_seq_len.item() != T:
                 self.attn_bias = self._create_sparse_layout(T, x.device)
-                self.last_seq_len = T
+                self.last_seq_len = torch.tensor(T, device=x.device, dtype=torch.long)
             
             # Reshape tensors for xformers
             # From: [batch, heads, seq, head_dim] to [batch, seq, heads, head_dim]
@@ -202,16 +209,35 @@ class CausalSelfAttention(nn.Module):
             v_xf = v.transpose(1, 2)  # [B, T, H, D]
             
             # Use memory efficient attention with the sparse pattern
-            y = xops.memory_efficient_attention(
-                q_xf, k_xf, v_xf,
-                attn_bias=self.attn_bias,
-                p=self.dropout if self.training else 0.0,
-                scale=1.0 / math.sqrt(self.head_dim)
-            )
-            
-            # Reshape result back to expected format
-            # From: [batch, seq, heads, head_dim] to [batch, heads, seq, head_dim]
-            y = y.transpose(1, 2)  # [B, H, T, D]
+            try:
+                y = xops.memory_efficient_attention(
+                    q_xf, k_xf, v_xf,
+                    attn_bias=self.attn_bias,
+                    p=self.dropout if self.training else 0.0,
+                    scale=1.0 / math.sqrt(self.head_dim)
+                )
+            except RuntimeError as e:
+                # Fallback to standard attention if xformers fails
+                print(f"Warning: xformers memory_efficient_attention failed, using standard attention instead. Error: {e}")
+                # Reshape back to standard format
+                q_std = q_xf.transpose(1, 2)
+                k_std = k_xf.transpose(1, 2)
+                v_std = v_xf.transpose(1, 2)
+                
+                # Create a causal mask as fallback
+                att_mask = torch.tril(torch.ones(T, T, device=x.device))
+                att_mask = att_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, T, T]
+                
+                # Standard attention
+                att = (q_std @ k_std.transpose(-2, -1)) * (1.0 / math.sqrt(k_std.size(-1)))
+                att = att.masked_fill(att_mask == 0, float('-inf'))
+                att = F.softmax(att, dim=-1)
+                att = self.attn_dropout(att)
+                y = att @ v_std
+            else:
+                # Reshape result back to expected format
+                # From: [batch, seq, heads, head_dim] to [batch, heads, seq, head_dim]
+                y = y.transpose(1, 2)  # [B, H, T, D]
         else:
             # Standard attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -224,7 +250,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
-
+    
 class MLP(nn.Module):
 
     def __init__(self, config):
