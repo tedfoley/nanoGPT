@@ -42,6 +42,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     return q_embed, k_embed
 
 class CausalSelfAttention(nn.Module):
+
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -50,90 +51,73 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.n_embd // config.n_head
         self.dropout = config.dropout
         
-        # Feature toggles
-        self.use_sparse_attn = config.use_sparse_attn if hasattr(config, 'use_sparse_attn') else False
+        # Add MQA toggle
         self.use_mqa = config.use_mqa if hasattr(config, 'use_mqa') else False
-        self.use_rope = config.use_rope if hasattr(config, 'use_rope') else False
-        self.use_flash_attn = (hasattr(config, 'use_flash_attn') and config.use_flash_attn 
-                              and hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
         
-        # Projection layers
         if self.use_mqa:
-            # MQA: multiple query heads, single key/value head
+            # For MQA: Multiple query heads, single key/value head
+            # n_embd for queries (all heads) + head_dim for keys + head_dim for values
             self.c_attn = nn.Linear(config.n_embd, 
                                    config.n_embd +  # For all query heads
                                    2 * self.head_dim,  # For single key and value head
                                    bias=config.bias)
         else:
-            # Standard attention
+            # Standard attention: key, query, value projections for all heads
             self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
             
-        # Output projection
+        # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        
-        # Dropout layers
+        # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         
-        # RoPE settings
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            # causal mask to ensure that attention is only applied to the left in the input sequence
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
+
+        # Added line to fix bug
+        self.use_sparse_attn = config.use_sparse_attn if hasattr(config, 'use_sparse_attn') else False
+
+        # Add RoPE parameters if enabled
+        self.use_rope = config.use_rope if hasattr(config, 'use_rope') else False
         if self.use_rope:
             self.head_dim = self.n_embd // self.n_head
             inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
             self.register_buffer("inv_freq", inv_freq)
         
-        # Register causal mask 
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                 .view(1, 1, config.block_size, config.block_size))
-        
-        # Fixed sparse mask settings
-        self.block_size = config.block_size
-        self.window_size = min(32, config.block_size // 4)
-        
+        # Flash attention toggle
+        self.use_flash_attn = (hasattr(config, 'use_flash_attn') and config.use_flash_attn 
+                              and hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
+        if not self.use_flash_attn:
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                      .view(1, 1, config.block_size, config.block_size))
+    
     def _get_rotary_embeddings(self, seq_len, device):
         t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
         freqs = torch.einsum('i,j->ij', t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
-    
-    def _create_sparse_mask(self, T, device):
-        """Vectorized sparse mask creation - compile friendly"""
-        # Create base causal mask
-        causal_mask = torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0)  # [1, 1, T, T]
-        
-        if T <= self.window_size or self.window_size <= 0:
-            return causal_mask
-        
-        # Create position indices
-        rows = torch.arange(T, device=device).view(-1, 1).expand(-1, T)  # [T, T]
-        cols = torch.arange(T, device=device).view(1, -1).expand(T, -1)  # [T, T]
-        
-        # Create window mask
-        window_mask = (rows >= cols) & (rows - cols <= self.window_size)  # [T, T]
-        
-        # Create global token mask (first few tokens can see everything, everything can see first few tokens)
-        global_rows = (rows < 2)  # First 2 tokens can see everything (within causal constraint)
-        global_cols = (cols < 2)  # All tokens can see first 2 tokens (within causal constraint)
-        global_mask = global_rows | global_cols  # [T, T]
-        
-        # Combine masks (using OR operation)
-        combined_mask = (window_mask | global_mask).unsqueeze(0).unsqueeze(0)  # [1, 1, T, T]
-        
-        # Apply causal constraint
-        sparse_mask = combined_mask & causal_mask.bool()
-        
-        return sparse_mask.float()
 
     def forward(self, x):
         B, T, C = x.size()
         
-        # Get query, key, value projections
         if self.use_mqa:
             # MQA implementation
             qkv = self.c_attn(x)
+            
+            # Split into query (all heads), key (single head), value (single head)
             q = qkv[:, :, :self.n_embd]  # B, T, n_embd
             k = qkv[:, :, self.n_embd:self.n_embd + self.head_dim]  # B, T, head_dim
             v = qkv[:, :, -self.head_dim:]  # B, T, head_dim
+            
+            # Reshape query to heads
             q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
+            
+            # For key and value, expand single head to all heads
             k = k.unsqueeze(1).expand(B, self.n_head, T, self.head_dim)  # (B, nh, T, hs)
             v = v.unsqueeze(1).expand(B, self.n_head, T, self.head_dim)  # (B, nh, T, hs)
         else:
@@ -150,45 +134,45 @@ class CausalSelfAttention(nn.Module):
         
         # Attention mechanism selection
         if self.use_flash_attn:
-            # Flash attention (PyTorch native)
+            # Flash attention
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, 
                                                             dropout_p=self.dropout if self.training else 0, 
                                                             is_causal=True)
-        
         elif self.use_sparse_attn:
+            # Create the sparse attention pattern if it doesn't exist yet
+            if not hasattr(self, 'sparse_mask') or self.sparse_mask.size(-1) < T:
+                # Define a more effective sparse pattern
+                window_size = int(math.sqrt(T))
+                sparse_mask = torch.zeros(T, T, device=x.device)
+                
+                # Implement a more efficient pattern:
+                # 1. Causal diagonal stripe pattern
+                for i in range(T):
+                    # Attend to blocks of tokens to capture local context
+                    start_idx = max(0, i - window_size)
+                    sparse_mask[i, start_idx:i+1] = 1
+                    
+                    # Add global tokens - first token and every window_size token
+                    sparse_mask[i, 0] = 1
+                    global_indices = torch.arange(0, i, window_size, device=x.device)
+                    if global_indices.numel() > 0:
+                        sparse_mask[i, global_indices] = 1
+                
+                self.sparse_mask = sparse_mask.view(1, 1, T, T)
+            
             # Compute attention scores
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             
-            # Get attention mask - vectorized implementation
-            # First get basic causal mask
-            causal_mask = self.bias[:,:,:T,:T]
+            # First apply causal mask
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
             
-            if T > self.window_size and self.window_size > 0:
-                # Create sparse attention mask
-                sparse_mask = self._create_sparse_mask(T, x.device)
-                
-                # Create attention bias: 0 for attention, large negative for masking
-                att_mask = torch.where(
-                    sparse_mask > 0,
-                    torch.zeros((1, 1, T, T), device=x.device),
-                    torch.ones((1, 1, T, T), device=x.device) * float('-inf')
-                )
-                
-                # Expand mask to match head dimension if needed
-                if att_mask.size(1) == 1 and self.n_head > 1:
-                    att_mask = att_mask.expand(-1, self.n_head, -1, -1)
-                
-                # Apply mask
-                att = att + att_mask
-            else:
-                # For shorter sequences, use regular causal attention
-                att = att.masked_fill(causal_mask == 0, float('-inf'))
+            # Then apply sparse mask (only to valid causal positions)
+            valid_sparse_mask = self.sparse_mask[:,:,:T,:T] * self.bias[:,:,:T,:T]
+            att = att.masked_fill((valid_sparse_mask == 0), float('-inf'))
             
-            # Complete attention calculation
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v
-            
         else:
             # Standard attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -196,8 +180,8 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v
-        
-        # Final projection
+            
+        # Rest of the forward pass
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
