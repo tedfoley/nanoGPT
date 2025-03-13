@@ -102,6 +102,25 @@ class CausalSelfAttention(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
 
+    def _create_sparse_indices(self, seq_len, device):
+        # Precompute which indices each position should attend to
+        indices = []
+        window_size = int(math.sqrt(seq_len))
+        
+        for i in range(seq_len):
+            # Local window + first token + global tokens
+            local_indices = torch.arange(max(0, i-window_size), i+1, device=device)
+            global_indices = torch.arange(0, min(i, seq_len), window_size, device=device)
+            
+            # Combine and deduplicate indices
+            position_indices = torch.cat([local_indices, global_indices])
+            position_indices = torch.unique(position_indices)
+            
+            indices.append(position_indices)
+            
+        return indices
+
+
     def forward(self, x):
         B, T, C = x.size()
         
@@ -139,40 +158,32 @@ class CausalSelfAttention(nn.Module):
                                                             dropout_p=self.dropout if self.training else 0, 
                                                             is_causal=True)
         elif self.use_sparse_attn:
-            # Create the sparse attention pattern if it doesn't exist yet
-            if not hasattr(self, 'sparse_mask') or self.sparse_mask.size(-1) < T:
-                # Define a more effective sparse pattern
-                window_size = int(math.sqrt(T))
-                sparse_mask = torch.zeros(T, T, device=x.device)
+            # Define sparsity pattern (once per sequence length)
+            if not hasattr(self, 'sparse_indices') or len(self.sparse_indices) != T:
+                # Reset indices for new sequence length
+                self.sparse_indices = self._create_sparse_indices(T, device=x.device)
                 
-                # Implement a more efficient pattern:
-                # 1. Causal diagonal stripe pattern
-                for i in range(T):
-                    # Attend to blocks of tokens to capture local context
-                    start_idx = max(0, i - window_size)
-                    sparse_mask[i, start_idx:i+1] = 1
-                    
-                    # Add global tokens - first token and every window_size token
-                    sparse_mask[i, 0] = 1
-                    global_indices = torch.arange(0, i, window_size, device=x.device)
-                    if global_indices.numel() > 0:
-                        sparse_mask[i, global_indices] = 1
+            # Initialize output
+            y = torch.zeros_like(q)
+            head_dim = C // self.n_head
+            
+            # Process each position with its own sparse attention pattern
+            for i in range(T):
+                # Get the relevant keys/values for this position
+                indices = self.sparse_indices[i]  # Get precomputed indices
+                k_sparse = k[:, :, indices, :]    # Select only needed keys
+                v_sparse = v[:, :, indices, :]    # Select only needed values
                 
-                self.sparse_mask = sparse_mask.view(1, 1, T, T)
-            
-            # Compute attention scores
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            
-            # First apply causal mask
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            
-            # Then apply sparse mask (only to valid causal positions)
-            valid_sparse_mask = self.sparse_mask[:,:,:T,:T] * self.bias[:,:,:T,:T]
-            att = att.masked_fill((valid_sparse_mask == 0), float('-inf'))
-            
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v
+                # Only compute attention for this position
+                q_pos = q[:, :, i:i+1, :]  # Just this query position
+                
+                # Compute attention scores only for the sparse pattern
+                attn_scores = (q_pos @ k_sparse.transpose(-2, -1)) / math.sqrt(head_dim)
+                attn_probs = F.softmax(attn_scores, dim=-1)
+                attn_probs = self.attn_dropout(attn_probs)
+                
+                # Get output for this position
+                y[:, :, i:i+1, :] = attn_probs @ v_sparse
         else:
             # Standard attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -181,7 +192,7 @@ class CausalSelfAttention(nn.Module):
             att = self.attn_dropout(att)
             y = att @ v
             
-        # Rest of the forward pass
+        # Common processing for all attention types
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
