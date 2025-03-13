@@ -15,6 +15,12 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+try:
+    import xformers.ops as xops
+    XFORMERS_AVAILABLE = True
+except ImportError:
+    XFORMERS_AVAILABLE = False
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
