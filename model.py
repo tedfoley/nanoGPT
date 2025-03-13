@@ -15,12 +15,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-try:
-    import xformers.ops as xops
-    XFORMERS_AVAILABLE = True
-except ImportError:
-    XFORMERS_AVAILABLE = False
-
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -59,35 +53,30 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = config.n_embd // config.n_head
         self.dropout = config.dropout
         
-        # Check for xformers if sparse attention is requested
+        # Feature toggles
         self.use_sparse_attn = config.use_sparse_attn if hasattr(config, 'use_sparse_attn') else False
-        if self.use_sparse_attn and not XFORMERS_AVAILABLE:
-            raise ImportError("xformers is required for efficient sparse attention. "
-                              "Install with: pip install xformers")
-        
-        # Add MQA toggle
         self.use_mqa = config.use_mqa if hasattr(config, 'use_mqa') else False
+        self.use_rope = config.use_rope if hasattr(config, 'use_rope') else False
+        self.use_flash_attn = (hasattr(config, 'use_flash_attn') and config.use_flash_attn 
+                              and hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
         
+        # Projection layers
         if self.use_mqa:
-            # For MQA: Multiple query heads, single key/value head
+            # MQA: multiple query heads, single key/value head
             self.c_attn = nn.Linear(config.n_embd, 
                                    config.n_embd +  # For all query heads
                                    2 * self.head_dim,  # For single key and value head
                                    bias=config.bias)
         else:
-            # Standard attention: key, query, value projections for all heads
+            # Standard attention
             self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
             
-        # output projection
+        # Output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
+        
+        # Dropout layers
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        
-        # Feature toggles and settings
-        self.use_rope = config.use_rope if hasattr(config, 'use_rope') else False
-        self.use_flash_attn = (hasattr(config, 'use_flash_attn') and config.use_flash_attn 
-                              and hasattr(torch.nn.functional, 'scaled_dot_product_attention'))
         
         # RoPE settings
         if self.use_rope:
@@ -95,17 +84,13 @@ class CausalSelfAttention(nn.Module):
             inv_freq = 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim))
             self.register_buffer("inv_freq", inv_freq)
         
-        # Initialize as empty tensors for DDP compatibility - crucial for proper synchronization
-        self.register_buffer("sparse_mask", torch.empty(0), persistent=False)
-        self.register_buffer("last_seq_len", torch.tensor(-1, dtype=torch.long), persistent=False)
-            
-        # Register causal mask for standard attention
-        if not self.use_flash_attn and not self.use_sparse_attn:
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                     .view(1, 1, config.block_size, config.block_size))
+        # Register causal mask 
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                 .view(1, 1, config.block_size, config.block_size))
         
-        # Store block size for sparse pattern creation
+        # Fixed sparse mask settings
         self.block_size = config.block_size
+        self.window_size = min(32, config.block_size // 4)  # Use a small window size for better DDP compatibility
         
     def _get_rotary_embeddings(self, seq_len, device):
         t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
@@ -113,61 +98,17 @@ class CausalSelfAttention(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
 
-    def _create_sparse_layout(self, seq_len, device):
-        """
-        Create a sparse attention pattern that's compatible with DDP
-        """
-        # Create a causal attention mask (lower triangular)
-        # This ensures deterministic behavior in DDP
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=device))
-        
-        # Apply fixed sparse pattern if sequence length is large enough
-        if seq_len > 16:  # Only apply sparse pattern for longer sequences
-            # Add global token attention (first token sees all, all tokens see first)
-            global_mask = torch.zeros(seq_len, seq_len, device=device)
-            global_mask[0, :] = 1.0  # First token attends to all
-            global_mask[:, 0] = 1.0  # All tokens attend to first
-            
-            # Add local window attention (each token attends to nearby tokens)
-            window_size = 16  # Fixed window size for determinism
-            local_mask = torch.zeros(seq_len, seq_len, device=device)
-            for i in range(seq_len):
-                start_idx = max(0, i - window_size // 2)
-                end_idx = min(seq_len, i + window_size // 2 + 1)
-                local_mask[i, start_idx:end_idx] = 1.0
-                
-            # Combine patterns with causal constraint
-            sparse_mask = torch.maximum(torch.maximum(causal_mask, global_mask), local_mask)
-        else:
-            # For short sequences, just use causal attention
-            sparse_mask = causal_mask
-            
-        # Format for attention bias
-        attn_mask = sparse_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
-        
-        # Convert to attention bias: 0 for attend, large negative for mask
-        attn_bias = torch.where(attn_mask > 0, 
-                               torch.zeros_like(attn_mask),
-                               torch.ones_like(attn_mask) * -10000.0)
-        
-        return attn_bias
-
     def forward(self, x):
         B, T, C = x.size()
         
+        # Get query, key, value projections
         if self.use_mqa:
             # MQA implementation
             qkv = self.c_attn(x)
-            
-            # Split into query (all heads), key (single head), value (single head)
             q = qkv[:, :, :self.n_embd]  # B, T, n_embd
             k = qkv[:, :, self.n_embd:self.n_embd + self.head_dim]  # B, T, head_dim
             v = qkv[:, :, -self.head_dim:]  # B, T, head_dim
-            
-            # Reshape query to heads
             q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
-            
-            # For key and value, expand single head to all heads
             k = k.unsqueeze(1).expand(B, self.n_head, T, self.head_dim)  # (B, nh, T, hs)
             v = v.unsqueeze(1).expand(B, self.n_head, T, self.head_dim)  # (B, nh, T, hs)
         else:
@@ -182,37 +123,52 @@ class CausalSelfAttention(nn.Module):
             cos, sin = self._get_rotary_embeddings(T, x.device)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
         
-        # Choose attention mechanism
+        # Attention mechanism selection
         if self.use_flash_attn:
-            # Flash attention
+            # Flash attention (PyTorch native)
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, 
                                                             dropout_p=self.dropout if self.training else 0, 
                                                             is_causal=True)
         
         elif self.use_sparse_attn:
-            # Update sparse mask if sequence length changed
-            if self.last_seq_len.item() != T:
-                self.sparse_mask = self._create_sparse_layout(T, x.device)
-                self.last_seq_len = torch.tensor(T, device=x.device, dtype=torch.long)
+            # Custom sparse attention implementation
+            # First compute standard attention scores
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             
-            try:
-                # Perform standard attention with sparse mask
-                # This is safer than using xops directly during DDP initialization
-                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-                att = att + self.sparse_mask[:,:,:T,:T]  # Apply sparse mask as additive bias
-                att = F.softmax(att, dim=-1)
-                att = self.attn_dropout(att)
-                y = att @ v
-            except Exception as e:
-                # Fallback to standard attention without mask
-                print(f"Warning: sparse attention failed with error: {e}. Using standard attention.")
-                # Standard attention with causal masking
-                causal_mask = torch.tril(torch.ones(T, T, device=x.device)).view(1, 1, T, T)
-                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # Create sparse mask (combination of causal + sparse pattern)
+            # 1. Start with causal mask 
+            causal_mask = self.bias[:,:,:T,:T]
+            
+            # 2. Create sparse pattern - only if sequence is long enough
+            if T > self.window_size and self.window_size > 0:
+                # Create a new mask that allows sliding window + first token
+                sparse_mask = torch.zeros_like(causal_mask)
+                
+                # Each token can attend to a window around it
+                for h in range(self.n_head):
+                    for i in range(T):
+                        # Local window attention (within the causal constraint)
+                        window_start = max(0, i - self.window_size)
+                        sparse_mask[:,h,i,window_start:i+1] = 1.0
+                        
+                        # Global tokens get full attention
+                        if i < 2:  # First few tokens attend to everything
+                            sparse_mask[:,h,i,:i+1] = 1.0
+                        
+                        # All tokens attend to first few tokens
+                        sparse_mask[:,h,i,:2] = causal_mask[:,h,i,:2]
+                
+                # Apply combined sparse pattern
+                att = att.masked_fill(sparse_mask == 0, float('-inf'))
+            else:
+                # For shorter sequences, just use causal mask
                 att = att.masked_fill(causal_mask == 0, float('-inf'))
-                att = F.softmax(att, dim=-1)
-                att = self.attn_dropout(att)
-                y = att @ v
+            
+            # Complete attention calculation
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v
+            
         else:
             # Standard attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -220,8 +176,8 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v
-            
-        # Common processing for all attention types
+        
+        # Final projection
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
