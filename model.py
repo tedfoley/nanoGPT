@@ -41,9 +41,6 @@ def apply_rotary_pos_emb(q, k, cos, sin):
     k_embed = (k * cos) + (_rotate_half(k) * sin)
     return q_embed, k_embed
 
-# This is a partial code snippet focusing just on the CausalSelfAttention class 
-# that needs modification to work with DDP
-
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -90,13 +87,41 @@ class CausalSelfAttention(nn.Module):
         
         # Fixed sparse mask settings
         self.block_size = config.block_size
-        self.window_size = min(32, config.block_size // 4)  # Use a small window size for better DDP compatibility
+        self.window_size = min(32, config.block_size // 4)
         
     def _get_rotary_embeddings(self, seq_len, device):
         t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
         freqs = torch.einsum('i,j->ij', t, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
+    
+    def _create_sparse_mask(self, T, device):
+        """Vectorized sparse mask creation - compile friendly"""
+        # Create base causal mask
+        causal_mask = torch.tril(torch.ones(T, T, device=device)).unsqueeze(0).unsqueeze(0)  # [1, 1, T, T]
+        
+        if T <= self.window_size or self.window_size <= 0:
+            return causal_mask
+        
+        # Create position indices
+        rows = torch.arange(T, device=device).view(-1, 1).expand(-1, T)  # [T, T]
+        cols = torch.arange(T, device=device).view(1, -1).expand(T, -1)  # [T, T]
+        
+        # Create window mask
+        window_mask = (rows >= cols) & (rows - cols <= self.window_size)  # [T, T]
+        
+        # Create global token mask (first few tokens can see everything, everything can see first few tokens)
+        global_rows = (rows < 2)  # First 2 tokens can see everything (within causal constraint)
+        global_cols = (cols < 2)  # All tokens can see first 2 tokens (within causal constraint)
+        global_mask = global_rows | global_cols  # [T, T]
+        
+        # Combine masks (using OR operation)
+        combined_mask = (window_mask | global_mask).unsqueeze(0).unsqueeze(0)  # [1, 1, T, T]
+        
+        # Apply causal constraint
+        sparse_mask = combined_mask & causal_mask.bool()
+        
+        return sparse_mask.float()
 
     def forward(self, x):
         B, T, C = x.size()
@@ -131,37 +156,32 @@ class CausalSelfAttention(nn.Module):
                                                             is_causal=True)
         
         elif self.use_sparse_attn:
-            # Custom sparse attention implementation
-            # First compute standard attention scores
+            # Compute attention scores
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             
-            # Create sparse mask (combination of causal + sparse pattern)
-            # 1. Start with causal mask 
+            # Get attention mask - vectorized implementation
+            # First get basic causal mask
             causal_mask = self.bias[:,:,:T,:T]
             
-            # 2. Create sparse pattern - only if sequence is long enough
             if T > self.window_size and self.window_size > 0:
-                # Create a new mask that allows sliding window + first token
-                sparse_mask = torch.zeros_like(causal_mask)
+                # Create sparse attention mask
+                sparse_mask = self._create_sparse_mask(T, x.device)
                 
-                # Each token can attend to a window around it
-                for h in range(self.n_head):
-                    for i in range(T):
-                        # Local window attention (within the causal constraint)
-                        window_start = max(0, i - self.window_size)
-                        sparse_mask[:,h,i,window_start:i+1] = 1.0
-                        
-                        # Global tokens get full attention
-                        if i < 2:  # First few tokens attend to everything
-                            sparse_mask[:,h,i,:i+1] = 1.0
-                        
-                        # All tokens attend to first few tokens
-                        sparse_mask[:,h,i,:2] = causal_mask[:,h,i,:2]
+                # Create attention bias: 0 for attention, large negative for masking
+                att_mask = torch.where(
+                    sparse_mask > 0,
+                    torch.zeros((1, 1, T, T), device=x.device),
+                    torch.ones((1, 1, T, T), device=x.device) * float('-inf')
+                )
                 
-                # Apply combined sparse pattern
-                att = att.masked_fill(sparse_mask == 0, float('-inf'))
+                # Expand mask to match head dimension if needed
+                if att_mask.size(1) == 1 and self.n_head > 1:
+                    att_mask = att_mask.expand(-1, self.n_head, -1, -1)
+                
+                # Apply mask
+                att = att + att_mask
             else:
-                # For shorter sequences, just use causal mask
+                # For shorter sequences, use regular causal attention
                 att = att.masked_fill(causal_mask == 0, float('-inf'))
             
             # Complete attention calculation
