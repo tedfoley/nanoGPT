@@ -229,8 +229,18 @@ if compile:
     model = torch.compile(model, backend=compile_backend) # requires PyTorch 2.0
 
 # wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)  # Add this flag
+if ddp and ddp_world_size > 1:
+    # Only use DDP when actually using multiple GPUs
+    model = DDP(
+        model, 
+        device_ids=[ddp_local_rank],
+        output_device=ddp_local_rank,
+        broadcast_buffers=False,
+        find_unused_parameters=True
+    )
+else:
+    # When using a single GPU, don't use DDP
+    ddp = False
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
