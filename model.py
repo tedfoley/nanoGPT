@@ -51,6 +51,11 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 
 class CausalSelfAttention(nn.Module):
 
+    @property
+    def active_attention_mechanism(self):
+        """Returns the name of the attention mechanism currently being used."""
+        return self._active_attn_mechanism
+        
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
@@ -58,6 +63,9 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_dim = config.n_embd // config.n_head
         self.dropout = config.dropout
+        
+        # Add a property to track which attention mechanism is actually being used
+        self._active_attn_mechanism = "unknown"
         
         # Add MQA toggle
         self.use_mqa = config.use_mqa if hasattr(config, 'use_mqa') else False
@@ -105,39 +113,64 @@ class CausalSelfAttention(nn.Module):
         
         # Initialize DeepSpeed sparse attention if available and enabled
         self.ds_sparse_attn = None
-        if self.use_sparse_attn and HAS_DEEPSPEED:
-            print("Using DeepSpeed Sparse Attention!")
-            # Define sparse attention configuration
-            # Using block sparse attention pattern
-            sparse_attn_config = {
-                # Choose one of several predefined sparsity patterns
-                "mode": "fixed",  # Options: fixed, variable, bigbird, bslongformer
-                "block": 16,      # Block size (16 is efficient for GPU operations)
-                "different_layout_per_head": True,
-                "num_local_blocks": 4,  # Number of local blocks to attend to
-                "num_global_blocks": 1,  # Number of global blocks to attend to
-                "attention_dropout": config.dropout,
-                "horizontal_global_attention": False,
-                "num_different_global_patterns": 4,
-            }
-            
-            # Initialize sparse attention module
-            try:
-                self.ds_sparse_attn = SparseSelfAttention(
-                    sparsity_config=sparse_attn_config,
-                    max_seq_length=config.block_size,
-                    attn_mask_mode='add',  # 'add' for additive mask, 'mul' for multiplicative
-                    attention_dropout=config.dropout
-                )
-                print("DeepSpeed SparseSelfAttention initialized successfully")
-            except Exception as e:
-                print(f"Failed to initialize DeepSpeed SparseSelfAttention: {e}")
-                print("Falling back to standard attention")
-                self.ds_sparse_attn = None
+        if self.use_sparse_attn:
+            if HAS_DEEPSPEED:
+                print("\n" + "="*80)
+                print("ATTENTION MECHANISM: Attempting to initialize DeepSpeed Sparse Attention")
+                print("="*80)
+                
+                # Define sparse attention configuration
+                # Using block sparse attention pattern
+                sparse_attn_config = {
+                    # Choose one of several predefined sparsity patterns
+                    "mode": "fixed",  # Options: fixed, variable, bigbird, bslongformer
+                    "block": 16,      # Block size (16 is efficient for GPU operations)
+                    "different_layout_per_head": True,
+                    "num_local_blocks": 4,  # Number of local blocks to attend to
+                    "num_global_blocks": 1,  # Number of global blocks to attend to
+                    "attention_dropout": config.dropout,
+                    "horizontal_global_attention": False,
+                    "num_different_global_patterns": 4,
+                }
+                
+                # Initialize sparse attention module
+                try:
+                    self.ds_sparse_attn = SparseSelfAttention(
+                        sparsity_config=sparse_attn_config,
+                        max_seq_length=config.block_size,
+                        attn_mask_mode='add',  # 'add' for additive mask, 'mul' for multiplicative
+                        attention_dropout=config.dropout
+                    )
+                    self._active_attn_mechanism = "deepspeed_sparse"
+                    print("\n" + "="*80)
+                    print("ATTENTION MECHANISM: DeepSpeed Sparse Attention SUCCESSFULLY initialized")
+                    print("="*80 + "\n")
+                except Exception as e:
+                    print("\n" + "="*80)
+                    print(f"ATTENTION MECHANISM: Failed to initialize DeepSpeed Sparse Attention: {e}")
+                    print(f"ATTENTION MECHANISM: Falling back to standard attention")
+                    print("="*80 + "\n")
+                    self.ds_sparse_attn = None
+                    self.use_sparse_attn = False
+                    self._active_attn_mechanism = "standard_fallback"
+            else:
+                print("\n" + "="*80)
+                print("ATTENTION MECHANISM: DeepSpeed is NOT INSTALLED")
+                print("ATTENTION MECHANISM: Sparse attention was requested but is NOT AVAILABLE")
+                print("ATTENTION MECHANISM: Falling back to standard attention")
+                print("="*80 + "\n")
                 self.use_sparse_attn = False
-        elif self.use_sparse_attn and not HAS_DEEPSPEED:
-            print("DeepSpeed is not available. Sparse attention will use standard attention instead.")
-            self.use_sparse_attn = False
+                self._active_attn_mechanism = "standard_fallback"
+        elif self.use_flash_attn:
+            self._active_attn_mechanism = "flash"
+            print("\n" + "="*80)
+            print("ATTENTION MECHANISM: Using Flash Attention")
+            print("="*80 + "\n")
+        else:
+            self._active_attn_mechanism = "standard"
+            print("\n" + "="*80)
+            print("ATTENTION MECHANISM: Using Standard Attention")
+            print("="*80 + "\n")
     
     def _get_rotary_embeddings(self, seq_len, device):
         t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
@@ -175,6 +208,13 @@ class CausalSelfAttention(nn.Module):
             cos, sin = self._get_rotary_embeddings(T, x.device)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
         
+        # First forward pass detection
+        if not hasattr(self, '_first_forward_done'):
+            self._first_forward_done = True
+            print("\n" + "="*80)
+            print(f"ATTENTION MECHANISM [FIRST FORWARD PASS]: Using {self._active_attn_mechanism} attention")
+            print("="*80 + "\n")
+            
         # Determine attention mechanism
         if self.use_flash_attn:
             # Flash attention
