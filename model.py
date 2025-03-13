@@ -17,7 +17,6 @@ from torch.nn import functional as F
 
 try:
     import xformers.ops as xops
-    from xformers.sparse import SparseCS
     XFORMERS_AVAILABLE = True
 except ImportError:
     XFORMERS_AVAILABLE = False
@@ -111,6 +110,7 @@ class CausalSelfAttention(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos(), emb.sin()
 
+    # Replace your _create_sparse_layout method with:
     def _create_sparse_layout(self, seq_len, device):
         """
         Create a sparse attention pattern combining:
@@ -118,39 +118,39 @@ class CausalSelfAttention(nn.Module):
         2. Local window attention
         3. Global token attention
         """
-        # Create a dense attention pattern (1.0 = attend, 0.0 = mask)
+        # Create a dense attention bias tensor
         dense_mask = torch.zeros(seq_len, seq_len, device=device)
         
-        # Window size for local attention (square root of sequence length)
+        # Window size for local attention
         window_size = max(1, int(math.sqrt(seq_len)))
         
         # Fill in the sparse pattern
         for i in range(seq_len):
-            # Each token always attends to itself
+            # Each token attends to itself
             dense_mask[i, i] = 1.0
             
             if i > 0:
-                # Local window attention: attend to previous window_size tokens
+                # Local window attention
                 start_idx = max(0, i - window_size)
                 dense_mask[i, start_idx:i] = 1.0
                 
                 # Global token attention
-                dense_mask[i, 0] = 1.0  # Always attend to the first token
-                
-                # Attend to strided global tokens (every window_size tokens)
+                dense_mask[i, 0] = 1.0
                 for j in range(window_size, i, window_size):
                     dense_mask[i, j] = 1.0
         
-        # Apply causal constraint (only attend to past tokens)
+        # Apply causal constraint
         causal_mask = torch.tril(torch.ones_like(dense_mask))
         dense_mask = dense_mask * causal_mask
         
-        # Format for xformers: [1, 1, seq_len, seq_len]
-        # This allows for broadcasting across all batch items and attention heads
-        dense_mask = dense_mask.unsqueeze(0).unsqueeze(0)
+        # Format for xformers attention bias
+        attn_bias = dense_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq_len, seq_len]
         
-        # Convert to sparse format expected by xformers
-        return SparseCS.from_dense(dense_mask)
+        # Convert values not equal to 1.0 to a large negative number for masking
+        attn_mask = torch.where(attn_bias > 0, 
+                                torch.zeros_like(attn_bias), 
+                                torch.ones_like(attn_bias) * -1e9)
+        return attn_mask
 
     def forward(self, x):
         B, T, C = x.size()
@@ -188,6 +188,7 @@ class CausalSelfAttention(nn.Module):
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, 
                                                             dropout_p=self.dropout if self.training else 0, 
                                                             is_causal=True)
+        
         elif self.use_sparse_attn:
             # Create/update sparse attention mask if sequence length changed
             if self.last_seq_len != T:
@@ -200,7 +201,7 @@ class CausalSelfAttention(nn.Module):
             k_xf = k.transpose(1, 2)  # [B, T, H, D]
             v_xf = v.transpose(1, 2)  # [B, T, H, D]
             
-            # Use xformers memory_efficient_attention with sparse pattern
+            # Use memory efficient attention with the sparse pattern
             y = xops.memory_efficient_attention(
                 q_xf, k_xf, v_xf,
                 attn_bias=self.attn_bias,
