@@ -15,6 +15,11 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+# Add to imports
+import os
+import traceback
+from datetime import datetime
+
 try:
     # Only import if available
     import deepspeed
@@ -111,56 +116,76 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                       .view(1, 1, config.block_size, config.block_size))
         
+        # Create a timestamp for the error log file
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.error_log_file = f"deepspeed_error_{timestamp}.log"
+        
         # Initialize DeepSpeed sparse attention if available and enabled
         self.ds_sparse_attn = None
         if self.use_sparse_attn:
-            if HAS_DEEPSPEED:
-                print("\n" + "="*80)
-                print("ATTENTION MECHANISM: Attempting to initialize DeepSpeed Sparse Attention")
-                print("="*80)
+            print("\n" + "="*80)
+            print("ATTENTION MECHANISM: Attempting to initialize DeepSpeed Sparse Attention")
+            
+            try:
+                # Try to import DeepSpeed
+                import deepspeed
+                from deepspeed.ops.sparse_attention import SparseSelfAttention
                 
                 # Define sparse attention configuration
-                # Using block sparse attention pattern
                 sparse_attn_config = {
-                    # Choose one of several predefined sparsity patterns
-                    "mode": "fixed",  # Options: fixed, variable, bigbird, bslongformer
-                    "block": 16,      # Block size (16 is efficient for GPU operations)
+                    "mode": "fixed",
+                    "block": 16,
                     "different_layout_per_head": True,
-                    "num_local_blocks": 4,  # Number of local blocks to attend to
-                    "num_global_blocks": 1,  # Number of global blocks to attend to
+                    "num_local_blocks": 4,
+                    "num_global_blocks": 1,
                     "attention_dropout": config.dropout,
                     "horizontal_global_attention": False,
                     "num_different_global_patterns": 4,
                 }
                 
-                # Initialize sparse attention module
+                # Try to initialize DeepSpeed sparse attention
                 try:
                     self.ds_sparse_attn = SparseSelfAttention(
                         sparsity_config=sparse_attn_config,
                         max_seq_length=config.block_size,
-                        attn_mask_mode='add',  # 'add' for additive mask, 'mul' for multiplicative
+                        attn_mask_mode='add',
                         attention_dropout=config.dropout
                     )
                     self._active_attn_mechanism = "deepspeed_sparse"
-                    print("\n" + "="*80)
                     print("ATTENTION MECHANISM: DeepSpeed Sparse Attention SUCCESSFULLY initialized")
-                    print("="*80 + "\n")
                 except Exception as e:
-                    print("\n" + "="*80)
-                    print(f"ATTENTION MECHANISM: Failed to initialize DeepSpeed Sparse Attention: {e}")
+                    # Log the error to a file
+                    error_msg = f"Failed to initialize DeepSpeed sparse attention: {str(e)}\n"
+                    error_msg += "Full traceback:\n"
+                    error_msg += traceback.format_exc()
+                    
+                    with open(self.error_log_file, "w") as f:
+                        f.write(error_msg)
+                    
+                    print(f"ATTENTION MECHANISM: Failed to initialize DeepSpeed Sparse Attention")
+                    print(f"ATTENTION MECHANISM: Error details written to {self.error_log_file}")
                     print(f"ATTENTION MECHANISM: Falling back to standard attention")
-                    print("="*80 + "\n")
+                    
                     self.ds_sparse_attn = None
                     self.use_sparse_attn = False
                     self._active_attn_mechanism = "standard_fallback"
-            else:
-                print("\n" + "="*80)
-                print("ATTENTION MECHANISM: DeepSpeed is NOT INSTALLED")
-                print("ATTENTION MECHANISM: Sparse attention was requested but is NOT AVAILABLE")
-                print("ATTENTION MECHANISM: Falling back to standard attention")
-                print("="*80 + "\n")
+            except ImportError as e:
+                # Log the error to a file
+                error_msg = f"DeepSpeed import error: {str(e)}\n"
+                error_msg += "Full traceback:\n"
+                error_msg += traceback.format_exc()
+                
+                with open(self.error_log_file, "w") as f:
+                    f.write(error_msg)
+                
+                print(f"ATTENTION MECHANISM: DeepSpeed is NOT INSTALLED or incompatible")
+                print(f"ATTENTION MECHANISM: Error details written to {self.error_log_file}")
+                print(f"ATTENTION MECHANISM: Falling back to standard attention")
+                
                 self.use_sparse_attn = False
                 self._active_attn_mechanism = "standard_fallback"
+            
+            print("="*80 + "\n")
         elif self.use_flash_attn:
             self._active_attn_mechanism = "flash"
             print("\n" + "="*80)
@@ -171,7 +196,7 @@ class CausalSelfAttention(nn.Module):
             print("\n" + "="*80)
             print("ATTENTION MECHANISM: Using Standard Attention")
             print("="*80 + "\n")
-    
+            
     def _get_rotary_embeddings(self, seq_len, device):
         t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
         freqs = torch.einsum('i,j->ij', t, self.inv_freq)
@@ -181,6 +206,13 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size()
         
+        # First forward pass detection
+        if not hasattr(self, '_first_forward_done'):
+            self._first_forward_done = True
+            print("\n" + "="*80)
+            print(f"ATTENTION MECHANISM [FIRST FORWARD PASS]: Using {self._active_attn_mechanism} attention")
+            print("="*80 + "\n")
+            
         if self.use_mqa:
             # MQA implementation
             qkv = self.c_attn(x)
@@ -208,40 +240,56 @@ class CausalSelfAttention(nn.Module):
             cos, sin = self._get_rotary_embeddings(T, x.device)
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
         
-        # First forward pass detection
-        if not hasattr(self, '_first_forward_done'):
-            self._first_forward_done = True
-            print("\n" + "="*80)
-            print(f"ATTENTION MECHANISM [FIRST FORWARD PASS]: Using {self._active_attn_mechanism} attention")
-            print("="*80 + "\n")
-            
-        # Determine attention mechanism
+        # Attention mechanism selection
         if self.use_flash_attn:
             # Flash attention
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, 
-                                                            dropout_p=self.dropout if self.training else 0, 
-                                                            is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, 
+                attn_mask=None,
+                dropout_p=self.dropout if self.training else 0,
+                is_causal=True
+            )
         elif self.use_sparse_attn and self.ds_sparse_attn is not None:
             # DeepSpeed sparse attention
-            # Reshape tensors to what DeepSpeed expects
-            # DeepSpeed expects shape [seq_len, batch_size, num_heads, head_size]
-            q = q.permute(2, 0, 1, 3)  # [T, B, nh, hs]
-            k = k.permute(2, 0, 1, 3)  # [T, B, nh, hs]
-            v = v.permute(2, 0, 1, 3)  # [T, B, nh, hs]
-            
-            # Create attention mask
-            attention_mask = torch.tril(torch.ones(T, T, device=x.device))
-            attention_mask = attention_mask.view(1, 1, T, T)
-            
-            # Call DeepSpeed sparse attention
-            attn_output = self.ds_sparse_attn(
-                q, k, v,
-                key_padding_mask=None,  # No padding in this case
-                attn_mask=attention_mask  # Causal mask
-            )
-            
-            # Reshape back to expected output format [B, nh, T, hs]
-            y = attn_output.permute(1, 2, 0, 3)
+            try:
+                # Reshape tensors to what DeepSpeed expects: [seq_len, batch_size, num_heads, head_size]
+                q_ds = q.permute(2, 0, 1, 3)  # [T, B, nh, hs]
+                k_ds = k.permute(2, 0, 1, 3)  # [T, B, nh, hs]
+                v_ds = v.permute(2, 0, 1, 3)  # [T, B, nh, hs]
+                
+                # Create attention mask
+                attention_mask = torch.tril(torch.ones(T, T, device=x.device))
+                attention_mask = attention_mask.view(1, 1, T, T)
+                
+                # Call DeepSpeed sparse attention
+                attn_output = self.ds_sparse_attn(
+                    q_ds, k_ds, v_ds,
+                    key_padding_mask=None,
+                    attn_mask=attention_mask
+                )
+                
+                # Reshape back to expected output format [B, nh, T, hs]
+                y = attn_output.permute(1, 2, 0, 3)
+            except Exception as e:
+                # Log the error to a file
+                forward_error_file = f"deepspeed_forward_error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+                error_msg = f"DeepSpeed sparse attention forward pass error: {str(e)}\n"
+                error_msg += "Full traceback:\n"
+                error_msg += traceback.format_exc()
+                
+                with open(forward_error_file, "w") as f:
+                    f.write(error_msg)
+                
+                print(f"\nERROR: DeepSpeed sparse attention failed during forward pass")
+                print(f"Error details written to {forward_error_file}")
+                print(f"Falling back to standard attention for this forward pass\n")
+                
+                # Fallback to standard attention for this forward pass
+                att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+                att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+                att = F.softmax(att, dim=-1)
+                att = self.attn_dropout(att)
+                y = att @ v
         else:
             # Standard attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
